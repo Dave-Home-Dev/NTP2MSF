@@ -36,8 +36,8 @@ transmitted as 1111100000, while all other seconds are transmitted as
 
 // Wi-Fi params
 #ifndef STASSID
-#define STASSID "REMOVED"
-#define STAPSK "REMOVED"
+#define STASSID "********"
+#define STAPSK "********"
 #endif
 
 // LED pins
