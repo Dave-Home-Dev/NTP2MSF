@@ -29,6 +29,8 @@ transmitted as 1111100000, while all other seconds are transmitted as
 
 */
 
+#include <array>
+#include <cmath>
 #include <ESP8266WiFi.h>
 #include <WiFiUdp.h>
 #include <time.h>
@@ -687,64 +689,76 @@ void setup() {
 //
 
 //
+// Parametric, constexpr LUT generator
+//
+template<size_t Steps>
+constexpr auto makeGammaLUT(double exponent = 2.2) {
+  return [=]() constexpr {
+    std::array<uint8_t, Steps> lut{};
+    const double divider = Steps - 1;
+    for (size_t i = 0; i < Steps; ++i) {
+      // compute the curve value, scale to 0..255, round properly
+      lut[i] = static_cast<uint8_t>(255 * std::pow(i / divider, exponent) + 0.5);
+    }
+    return lut;
+  }
+  ();  // immediately invoke the lambda
+}
+
+//
 // Blocking function that will pulse the LED for a given while at a given rate
 // 21 brightness levels
 // Full cycle will be 40 steps
 //
-void pulseLED(uint32_t duration_ms, uint8_t ms_step, bool dim)
-{
-    static const uint8_t pwm_lut[] = {
-        10, 12, 14, 16, 19, 22, 26,
-        31, 37, 43, 50, 59, 70, 82,
-        97, 113, 133, 157, 184, 217, 255
-    };
-    static const uint8_t max_idx = sizeof(pwm_lut) - 1;
+void pulseLED(uint32_t duration_ms, uint8_t ms_step, bool dim) {
+  static const uint8_t max_idx = 20;
+  static constexpr auto pwm_lut = makeGammaLUT<max_idx + 1>();
 
-    uint8_t level = 0;
-    int8_t step = 1;
-    uint32_t lastmillis = millis();
-    uint32_t wakeup = lastmillis + duration_ms;
-    uint8_t pwm = dim ? pwm_lut[level] / 2 : pwm_lut[level];
+  uint8_t level = 0;
+  int8_t step = 1;
+  uint32_t lastmillis = millis();
+  uint32_t wakeup = lastmillis + duration_ms;
+  uint8_t pwm = dim ? pwm_lut[level] / 2 : pwm_lut[level];
 
-    // Bresenham accumulator for PWM
-    uint16_t acc = 0;
+  // Bresenham accumulator for PWM
+  uint16_t acc = 0;
 
-    // WDT will fire if we don't yeild every 1.5s or so.  Prevent WDT firing....
-    if (ms_step > 75) {
-      ms_step = 75; 
+  // WDT will fire if we don't yeild every 1.5s or so.  Prevent WDT firing....
+  if (ms_step > 75) {
+    ms_step = 75;
+  }
+
+  while ((int32_t)(wakeup - millis()) > 0) {
+
+    // PWM tick, 250kHz
+    acc += pwm;
+    if (acc >= 255) {
+      acc -= 255;
+      LEDon();
+    } else {
+      LEDoff();
     }
 
-    while ((int32_t)(wakeup - millis()) > 0) {
+    delayMicroseconds(10);  // 10 µs tick → 100 kHz PWM clk or 392 Hz pulse rate
 
-        // PWM tick, 250kHz
-        acc += pwm;
-        if (acc >= 255) {
-            acc -= 255;
-            LEDon();
-        } else {
-            LEDoff();
-        }
+    // Update fade level at ms_step
+    uint32_t now = millis();
+    if ((uint32_t)(now - lastmillis) >= ms_step) {
+      // reverse direction at edges, call yield for WDT
+      if (level == 0) {
+        step = 1;
+        yield();
+      } else if (level == max_idx) {
+        step = -1;
+        yield();
+      }
 
-        delayMicroseconds(10); // 10 µs tick → 100 kHz PWM clk or 392 Hz pulse rate
-
-        // Update fade level at ms_step
-        uint32_t now = millis();
-        if ((uint32_t)(now - lastmillis) >= ms_step) {
-            // reverse direction at edges, call yield for WDT
-            if (level == 0) {
-                step = 1;
-                yield();
-            } else if (level == max_idx) {
-                step = -1;
-                yield();
-            }
-
-            level += step;
-            pwm = dim ? pwm_lut[level] / 2 : pwm_lut[level];
-            lastmillis = now;
-        }
+      level += step;
+      pwm = dim ? pwm_lut[level] / 2 : pwm_lut[level];
+      lastmillis = now;
     }
-    LEDoff();
+  }
+  LEDoff();
 }
 
 //
