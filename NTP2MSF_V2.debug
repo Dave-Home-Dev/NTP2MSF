@@ -1,0 +1,763 @@
+/*
+
+From Wikipedia:
+
+Each UTC second begins with 100 ms of 'off', preceded by at least 500 ms of
+carrier. The second marker is transmitted with an accuracy better than ±1 ms
+relative to Coordinated Universal Time (UTC), which is itself always within
+±0.9 seconds of Universal Time (UT1) which is the mean solar time which would
+actually be observed at 0° longitude.
+
+The first second of the minute, denoted second 00, begins with a period of 500
+ms with the carrier off, to serve as a minute marker.
+
+The other 59 (or, exceptionally, 60 or 58) seconds of the minute always begin
+with at least 100 ms 'off', followed by two data bits of 100 ms each, and end
+with at least 700 ms of carrier.
+
+Bit A is transmitted from 100 to 200 ms after the second
+Bit B is transmitted from 200 to 300 ms after the second
+
+Negative Polarity Bit Signalling
+
+Carrier ON represents a bit value of 0.
+Carrier OFF represents a bit value of 1.
+
+If each second is considered as ten 100 ms pieces, the minute marker is
+transmitted as 1111100000, while all other seconds are transmitted as
+1AB0000000
+
+*/
+
+#include <ESP8266WiFi.h>
+#include <WiFiUdp.h>
+#include <time.h>
+#include <user_interface.h>  // for system_rtc_mem_read/write
+
+#define BAUDRATE 115200
+
+// Wi-Fi params
+#ifndef STASSID
+#define STASSID "********"
+#define STAPSK "********"
+#endif
+
+// LED pins
+#define MSF_PIN D2  // GPIO pin connected to IC101 DATA IN via 1–10kΩ resistor
+#define LED_PIN D4  // Status LED - D8 = GPIO 15
+
+// LED GPIOs
+#define MSF_GPIO 4
+#define LED_GPIO 2
+
+// Debugging flags
+#define INVERT_TCO 0
+#define MSF_DEBUG 1
+#define ISR_DEBUG 0
+#define SLEEP_TEST_MODE 1
+#define ENABLE_SLEEP_MODE 1
+
+// Define A nd B bit positions
+#define A 0
+#define B 1
+
+//
+// Global constants
+//
+
+//
+// Wi-Fi & NTP logic
+//
+const char *ssid = STASSID;                     // your network SSID (name)
+const char *pass = STAPSK;                      // your network password
+const char *ntpServerName = "uk.pool.ntp.org";  // Hostname of NTP pool
+
+//
+// Optional static IP (avoids DHCP delay)
+//
+const IPAddress local_IP(192,168,0,241);
+const IPAddress gateway(192,168,0,1);
+const IPAddress subnet(255,255,255,0);
+const IPAddress dns1(192,168,0,1);
+
+//
+// Numerical constants
+//
+constexpr uint16_t LOCALPORT             = 2390;                               // local port to listen for UDP packets
+constexpr size_t   NTP_PACKET_SIZE       = 48;                                 // NTP time stamp is in the first 48 bytes of the message
+constexpr uint32_t SEVENTY_YEARS         = 2208988800UL;                       // NTP timestamp of UNIX epoch
+constexpr uint32_t STW_DURATION          = 3660;                               // Duration (seconds) to show the STW flag for before DST change
+constexpr uint32_t WAKE_UP_TIME          = 2 * 3600 + 59 * 60;                 // Local time
+constexpr uint32_t RUN_DURATION          = 61 * 60;                            // How long to run for before sleeping
+constexpr uint32_t TICKS_PER_MS          = F_CPU / 16 / 1000;                  // Duration of a subbit in ms
+constexpr uint32_t SUBBIT_DURATION_MS    = 100;                                // A subbit is 100ms
+constexpr uint32_t SUBBIT_DURATION_TICKS = SUBBIT_DURATION_MS * TICKS_PER_MS;  // A subbit is 100ms
+
+//
+// Global variables
+//
+
+//
+// Wi-Fi + NTP
+//
+IPAddress timeServerIP;              // Store IP address of the UK NTP pool
+byte packetBuffer[NTP_PACKET_SIZE];  // buffer to hold incoming and outgoing packets
+WiFiUDP udp;                         // A UDP instance to let us send and receive packets over UDP
+
+//
+// Time keeping
+//
+uint32_t lastResyncMillis;  // Timestamp of when we received the NTP packet
+uint32_t firstMillis;       // Timestamp of when we received the first NTP packet
+
+//
+// Data shared between ISR and main loop
+//
+volatile uint8_t msfBits[60][2] = { 0 };  // 120-bit MSF frame
+volatile bool nextFrame = false;          // Indicate when to build the next MSF frame
+volatile uint8_t ISR_bit = 0;
+volatile uint8_t ISR_subbit = 0;
+
+//
+// EEPROM data structure
+//
+
+const uint32_t VERSION = 2; // Used to invalidate the CRC
+
+struct __attribute__((packed)) {
+  time_t nextRunTimeUtc;
+  time_t lastSleepTimeUtc;
+  uint32_t version = VERSION; // Used to invalidate the CRC
+  bool firstHour;
+  uint32_t crc;
+} rtcData;
+
+//
+// Shared UTC timestamps
+//
+time_t utcTime = 0;
+time_t nextSleepTime = 0;
+
+//
+// BST bookends
+//
+time_t bst_start;
+time_t bst_end;
+
+//
+// ISR to toggle output pin(s)
+//
+
+void IRAM_ATTR onTimerISR() {
+  static uint8_t carrier = 1;
+
+  if (ISR_bit == 0) {
+    switch (ISR_subbit) {
+      case 0:
+      case 1:
+      case 2:
+      case 3:
+      case 4:
+        // carrier off 500 ms
+        carrier = LOW;
+        break;
+      case 5:
+      case 6:
+      case 7:
+      case 8:
+      case 9:
+        // carrier on 500 ms
+        carrier = HIGH;
+        break;
+    }
+  } else {
+    switch (ISR_subbit) {
+      case 0:
+        // carrier off 100 ms
+        carrier = LOW;
+        break;
+      case 1:
+        // 0 = carrier on
+        // 1 = carrier off
+        carrier = msfBits[ISR_bit][A] ? LOW : HIGH;
+        break;
+      case 2:
+        // 0 = carrier on
+        // 1 = carrier off
+        carrier = msfBits[ISR_bit][B] ? LOW : HIGH;
+        break;
+      default:
+        // carrier on 700ms
+        carrier = HIGH;
+        break;
+    }
+  }
+
+#if INVERT_TCO
+  carrier = (carrier == HIGH) ? LOW : HIGH;
+#endif
+
+  if (carrier == HIGH) {
+    GPIO_REG_WRITE(GPIO_OUT_W1TS_ADDRESS, 1 << MSF_GPIO);  // Set HIGH
+  } else {
+    GPIO_REG_WRITE(GPIO_OUT_W1TC_ADDRESS, 1 << MSF_GPIO);  // Set LOW
+  }
+
+  if (++ISR_subbit == 10) {
+    ISR_subbit = 0;
+    if (++ISR_bit == 60) {
+      ISR_bit = 0;
+      // We have 100ms to calculate the next frame
+      // Fortunately, it only takes ~1ms.
+      nextFrame = true;
+    }
+  }
+}
+
+//
+// Flash the built-in LED n times
+// N.B. LED pin is active low / current sink
+//
+void FlashLED(uint8_t count) {
+  uint8_t i = count;
+  while (i--) {
+    GPIO_REG_WRITE(GPIO_OUT_W1TC_ADDRESS, 1 << LED_GPIO);  // Set LOW
+    delay(1);
+    GPIO_REG_WRITE(GPIO_OUT_W1TS_ADDRESS, 1 << LED_GPIO);  // Set HIGH
+    if (i)
+      delay(199);
+  }
+}
+
+uint32_t calculateCRC32(const uint8_t *data, size_t length) {
+  uint32_t crc = 0xFFFFFFFF;
+  while (length--) {
+    uint8_t c = *data++;
+    for (uint8_t i = 0; i < 8; i++) {
+      uint32_t mix = (crc ^ c) & 0x01;
+      crc >>= 1;
+      if (mix) crc ^= 0xEDB88320;
+      c >>= 1;
+    }
+  }
+  return ~crc;
+}
+
+bool loadRTCData() {
+  system_rtc_mem_read(64, &rtcData, sizeof(rtcData));
+  if (rtcData.crc != calculateCRC32((uint8_t *)&rtcData, sizeof(rtcData) - 4) || rtcData.version != VERSION) {
+    // Invalid or uninitialised data — set defaults
+    rtcData.firstHour = true;
+    rtcData.nextRunTimeUtc = 0;
+    rtcData.version = VERSION;
+    saveRTCData();
+    return false;
+  }
+  return true;
+}
+
+void saveRTCData() {
+  rtcData.crc = calculateCRC32((uint8_t *)&rtcData, sizeof(rtcData) - 4);
+  system_rtc_mem_write(64, &rtcData, sizeof(rtcData));
+}
+
+//
+// Set up NTP server and start UDP listener
+//
+void setup() {
+
+  Serial.begin(BAUDRATE);
+
+  for(int i (0); i<64; ++i)
+    Serial.print('\n');
+  
+  pinMode(MSF_PIN, OUTPUT);
+  digitalWrite(MSF_PIN, LOW);
+
+  pinMode(LED_PIN, OUTPUT);  // Active LOW / current sink
+  digitalWrite(LED_PIN, HIGH);
+
+  // Clear screen
+  Serial.print(
+      "\x1b\x5b\x32\x4a"  // Erase display buffer
+      "\x1b\x5b\x33\x4a"  // Erase scrollback buffer
+      "\x1b\x5b\x48"      // Cursor home
+      );
+
+  Serial.flush();
+
+  // We start by connecting to a WiFi network
+  Serial.printf("\n\nConnecting to %s\n", ssid);
+
+  WiFi.mode(WIFI_STA);
+  if (REASON_DEEP_SLEEP_AWAKE == system_get_rst_info()->reason) {
+    //Serial.println("Reboot from deep sleep: fast reconnect");
+    WiFi.persistent(false);
+    WiFi.config(local_IP,gateway,subnet,dns1);
+    WiFi.begin(); // reuse stored creds
+  } else {
+    //Serial.println("First boot: storing credentials in flash");
+    WiFi.persistent(true);
+    WiFi.config(local_IP,gateway,subnet,dns1);
+    WiFi.begin(ssid, pass);
+  }
+
+  while (WiFi.status() != WL_CONNECTED) {
+    yield();
+  }
+  Serial.print('\n');
+
+  Serial.printf("WiFi connected\nIP address : %s\n", WiFi.localIP().toString().c_str());
+
+  Serial.print("Starting UDP\n");
+  udp.begin(LOCALPORT);
+  Serial.printf("Local port : %d\n", udp.localPort());
+
+  //get a random server from the pool
+  WiFi.hostByName(ntpServerName, timeServerIP);
+
+  Serial.print("Reading RTC RAM\n");
+
+  // Order matters! Call GetNtpTime first!
+  if (GetNtpTime(&utcTime, NULL)
+      && REASON_DEEP_SLEEP_AWAKE == system_get_rst_info()->reason
+      && loadRTCData()
+      && rtcData.firstHour == false
+      && rtcData.nextRunTimeUtc > utcTime) {
+    time_t temp = rtcData.nextRunTimeUtc - utcTime;
+    if (temp <= 86400 && temp > 60) {  // If more than a minute remaining, take a nap.
+      if (temp > 3600) { // If more that 60 minutes remaining
+        temp = 3600;     // cap next nap at 60 minutes
+      }
+
+#if SLEEP_TEST_MODE
+      time_t tempTime = utcTime - (millis() / 1000);
+      DumpEpochTime("Awoken at", tempTime, false);
+      DumpEpochTime("Target time", rtcData.nextRunTimeUtc, false);
+      Serial.printf("Remaining time : %9lld s\n", rtcData.nextRunTimeUtc - utcTime);
+      Serial.printf("Sleeping for   : %9lld s\n", temp);
+#endif
+
+      Serial.printf("Total uptime   : %9lu ms\n\n", millis());
+      Serial.flush();
+
+      ESP.deepSleep((uint64_t)temp * 1000000ULL, WAKE_RF_DEFAULT);
+    }
+  }
+#if SLEEP_TEST_MODE
+  else {
+    time_t tempTime = utcTime - (millis() / 1000);
+    DumpEpochTime("Awoken at", tempTime, false);
+    Serial.print("Not sleeping...\n");
+  }
+#endif
+  // Continue to send MSF!
+
+// #if SLEEP_TEST_MODE
+//   nextSleepTime = utcTime - (utcTime % 60) + 300;
+//   DumpEpochTime("Next sleep at", nextSleepTime, false);
+// #else
+  nextSleepTime = utcTime - (utcTime % 60) + RUN_DURATION;
+// #endif
+
+  // 80MHz / 16 / 10 = 10Hz
+  timer1_isr_init();
+  timer1_attachInterrupt(onTimerISR);
+  timer1_write(SUBBIT_DURATION_TICKS);
+
+  FlashLED(3);
+
+  firstMillis = millis();
+
+  // Critical timing starts here!
+
+  InitialiseClock();
+}
+//
+// End of setup()
+//
+
+//
+//  Get NTP time
+//  Returns TRUE upon successfully retrieving an NTP packet
+//
+bool GetNtpTime(time_t *utcTime_p, uint32_t *milliseconds)
+{
+  uint32_t cb = 0;
+
+#if MSF_DEBUG
+  Serial.print("Requesting NTP packet\n");
+#endif
+
+  // Retry ten times
+  for (uint32_t j = 0; j < 10 && !cb; ++j) {
+    sendNTPpacket(timeServerIP);  // send an NTP packet to a time server
+    // Poll buffers for response
+    for (uint32_t i = 0; i < 1000 && !cb; ++i) {
+      delay(1);
+      cb = udp.parsePacket();
+    };
+  }
+
+  lastResyncMillis = millis();  // Mark moment packet was delivered
+
+  if (!cb) {
+#if MSF_DEBUG
+    Serial.print("Failed to retrieve an NTP packet!\n");
+#endif
+    return false;
+  }
+
+  udp.read(packetBuffer, NTP_PACKET_SIZE);  // read the packet into the buffer
+
+#if MSF_DEBUG
+  Serial.printf("packet received, length = %d\n", cb);
+#endif
+
+  //the timestamp starts at byte 40 of the received packet and is four bytes,
+  uint32_t secsSince1900 = (packetBuffer[40]<<24) | (packetBuffer[41]<<16) | (packetBuffer[42]<<8) | (packetBuffer[43]<<0);
+
+  // Calculate UTC Unix epoch time
+  *utcTime_p = secsSince1900 - SEVENTY_YEARS;
+
+  // Word out milliseconds fraction in bytes 44-47
+  if (milliseconds) {
+    *milliseconds = (1000L * word(packetBuffer[44], packetBuffer[45])) / 65536L;
+  }
+
+  return true;
+}
+
+//
+// Common helper function to dump epoch time into a human intellible form
+//
+void DumpEpochTime(const char *msg, time_t epochTime, bool isBst) {
+  static const char *wdays[] = { "SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT" };
+  // Calculate DST limits for current year
+  struct tm *t = gmtime(&epochTime);
+
+  uint32_t year = t->tm_year + 1900;
+  uint32_t mon = t->tm_mon + 1;
+  uint32_t mday = t->tm_mday;
+  uint32_t wday = t->tm_wday;
+  uint32_t hr = t->tm_hour;
+  uint32_t min = t->tm_min;
+  uint32_t sec = t->tm_sec;
+
+  Serial.printf("%-20s : %02d:%02d:%02d (%s:00) %s %02d/%02d/%04d\n", msg,
+                hr, min, sec,
+                isBst ? "+01" : "+00",
+                (wday < 7) ? wdays[wday] : "UNKNOWN",
+                mday, mon, year);
+}
+
+//
+//  Send NTP request and initialise time settings
+//
+void InitialiseClock() {
+  uint32_t elapsed (0);
+  uint32_t ntpMilliSeconds (0);
+  uint32_t startInitialiseClock (millis());
+
+  // No Wi-Fi?  Bail out now!
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  timer1_disable();
+
+  if (!GetNtpTime(&utcTime, &ntpMilliSeconds)) {
+    return;
+  }
+
+  // Calculate DST limits for current year
+  struct tm *t = gmtime(&utcTime);
+  uint32_t year = static_cast<uint32_t>(t->tm_year + 1900);
+  bst_start = last_sunday_utc(year, 3);
+  bst_end = last_sunday_utc(year, 10);
+
+#if MSF_DEBUG
+  DumpEpochTime("utcTime", utcTime, false);
+#endif
+
+  uint32_t modulo60 = (utcTime % 60);
+
+  utcTime -= modulo60;  // Round off seconds, add 60s = time at end of current minute
+
+  elapsed = millis() - startInitialiseClock;
+
+  Serial.printf("Time to retrieve and parse NTP data : %u ms\n", elapsed);
+
+  // Calculate the exact milliseconds until the start of the next subbit
+  uint32_t elapsedSinceNtp = millis() - lastResyncMillis;  // time since NTP packet received
+  uint32_t subbitOffset    = SUBBIT_DURATION_MS;           // small offset for ISR alignment
+  uint32_t secondsMs       = 1000 * (modulo60);            // milliseconds into current minute
+
+  // Total time since the last full minute
+  uint32_t totalMs = secondsMs + ntpMilliSeconds + elapsedSinceNtp + subbitOffset;
+
+  // Compute remaining time to sleep until the next minute starts
+  uint32_t sleepMs = (totalMs < 60000) ? (60000 - totalMs)
+                                       : (120000 - totalMs);  // wrap-around for safety
+
+#if MSF_DEBUG
+  Serial.printf("Sleeping for: %u ms\n", sleepMs);
+#endif
+
+  delay(sleepMs);  // wait precisely until the next subbit / minute boundary
+
+#if MSF_DEBUG
+  Serial.printf("Awake!\n");
+#endif
+
+  // Prime the ISR related variables
+  ISR_bit = 0;
+  ISR_subbit = 0;
+  nextFrame = true;
+
+  // Wake up and enable timer interrupts
+  timer1_enable(TIM_DIV16, TIM_EDGE, TIM_LOOP);
+}
+
+//
+// Cacluate the next MSF frame
+//
+void loop() {
+
+  // wait
+  if (!nextFrame) {
+    return;
+  }
+
+  nextFrame = false;
+
+  utcTime += 60;  // Increment UTC time by one minute
+
+  buildMSFframe(utcTime + 60);  // One minute ahead
+
+  // Up to here ~8 ms
+
+  // Now have ~59.9xx seconds until the next update is due.
+
+#if ENABLE_SLEEP_MODE
+  // After an hour, sleep until 3 am
+  DumpEpochTime("utcTime", utcTime, false);
+  DumpEpochTime("nextSleepTime", nextSleepTime, false);
+  if (utcTime >= nextSleepTime) {
+    sleepUntil();
+  }
+#endif
+}
+
+//
+// send an NTP request to the time server at the given address
+//
+void sendNTPpacket(IPAddress &address) {
+  // set all bytes in the buffer to 0
+  memset(packetBuffer, 0, NTP_PACKET_SIZE);
+  // Initialize values needed to form NTP request
+  // (see URL above for details on the packets)
+  packetBuffer[0] = 0b11100011;  // LI, Version, Mode
+  packetBuffer[1] = 0;           // Stratum, or type of clock
+  packetBuffer[2] = 6;           // Polling Interval
+  packetBuffer[3] = 0xEC;        // Peer Clock Precision
+  // 8 bytes of zero for Root Delay & Root Dispersion
+  packetBuffer[12] = 49;
+  packetBuffer[13] = 0x4E;
+  packetBuffer[14] = 49;
+  packetBuffer[15] = 52;
+
+  // all NTP fields have been given values, now
+  // you can send a packet requesting a timestamp:
+  udp.beginPacket(address, 123);  //NTP requests are to port 123
+  udp.write(packetBuffer, NTP_PACKET_SIZE);
+  udp.endPacket();
+}
+
+//
+// Build a MSF frame using the supplied UNIX epoch time
+//
+void buildMSFframe(time_t epochTime) {
+
+  noInterrupts();
+
+  // Use 3660 because the STW flag should be set for 61 minutes before change over
+  bool stw = ((bst_start > epochTime) && (bst_start - epochTime <= STW_DURATION)) || ((bst_end > epochTime) && (bst_end - epochTime <= STW_DURATION));
+  bool bst = (epochTime >= bst_start) && (epochTime < bst_end);
+
+  time_t localtime = epochTime + (bst ? 3600 : 0);  // Round off seconds
+
+  struct tm *t = gmtime(&localtime);
+
+  DumpEpochTime("MSF Encoding", localtime, bst);
+
+  // Prepare array
+  for (uint32_t i = 1; i < 59; i++) {
+    msfBits[i][A] = 0;
+    msfBits[i][B] = 0;
+  }
+
+  // Encode fields with correct bit lengths
+  encodeBCD(17, t->tm_year % 100, 8);  // year units  0-99
+  encodeBCD(25, t->tm_mon + 1, 5);     // month units 1-12
+  encodeBCD(30, t->tm_mday, 6);        // day units   1-31
+
+  encodeBCD(36, t->tm_wday, 3);        // DOW, 3 bits 0=Sunday, 6=Saturday
+
+  encodeBCD(39, t->tm_hour, 6);        // hour units   0-23
+  encodeBCD(45, t->tm_min, 7);         // minute units 0-59
+
+  //msfBits[52][A] = 0;  // Minute marker
+  //msfBits[52][B] = 0;  // Minute marker
+
+  // DST flag
+  msfBits[53][A] = 1;
+  msfBits[53][B] = stw;  // DST change warning (set 1 if 1 hour before BST/GMT change)
+
+  // Minute marker pattern (52–57) is usually 011111, but simplified here
+  msfBits[54][A] = 1;
+  msfBits[54][B] = oddParity(17, 24);
+  msfBits[55][A] = 1;
+  msfBits[55][B] = oddParity(25, 35);
+  msfBits[56][A] = 1;
+  msfBits[56][B] = oddParity(36, 38);
+  msfBits[57][A] = 1;
+  msfBits[57][B] = oddParity(39, 51);
+
+  // DST flag
+  msfBits[58][A] = 1;
+  msfBits[58][B] = bst;  // DST currently in effect: 1=BST, 0=GMT
+
+#if MSF_DEBUG
+  for (uint32_t i = 0; i < 60; ++i) {
+    if (i == 17 || i == 25 || i == 30 || i == 36 || i == 39 || i == 39 || i == 45 || i == 52 || i == 58) {
+      Serial.print("| ");
+    }
+    Serial.printf("%d%d ", msfBits[i][A], msfBits[i][B]);
+  }
+  Serial.print('\n');
+#endif
+
+  interrupts();
+}
+
+//
+// Encode value to BCD using given bit length
+//
+void encodeBCD(uint32_t start, uint32_t val, uint32_t bits) {
+  uint32_t position = start + bits - 1;  // position of LSB
+  uint32_t remaining = bits;
+  while (remaining > 0) {
+    uint32_t i_max = remaining > 4 ? 4 : remaining;
+    uint8_t digit = val % 10;
+    val /= 10;
+    remaining -= i_max;
+    for (uint32_t i = 0; i < i_max; ++i) {
+      msfBits[position--][A] = (digit >> i) & 1;
+    }
+  }
+}
+
+//
+// Odd parity calculation
+//
+uint8_t oddParity(uint32_t a, uint32_t b) {
+  uint32_t ones = 0;
+  // Count number of bits set to 1
+  for (uint32_t i = a; i <= b; i++)
+    if (msfBits[i][A]) ones++;
+  // Calculate parity bit to make the total odd
+  return 1 - (ones & 1);  // make total number of 1s odd
+}
+
+//
+// Deep sleep until next 3 am
+// Note: UTCtime is time of the next timestamp to be sent, so is 1m ahead
+//
+void sleepUntil() {
+  bool bst = (utcTime >= bst_start) && (utcTime < bst_end);
+  time_t utcMidnight = utcTime - (utcTime % 86400);
+  time_t dstOffset = bst ? 3600 : 0;
+  time_t localTime = utcTime + dstOffset;
+  time_t timeOfDay = localTime % 86400;
+  time_t targetSec = WAKE_UP_TIME;  // 03:00:00
+
+  Serial.print("Called sleepUntil\n");
+
+  // Calculate target wake up time from local time of day
+  // If targetSec is < 10s in the future, add 24h
+  if (targetSec < timeOfDay)
+    targetSec += 24 * 3600;
+
+  Serial.print("Writing RTC RAM\n");
+  rtcData.firstHour = false;
+  rtcData.nextRunTimeUtc = utcMidnight + targetSec - dstOffset;
+  rtcData.lastSleepTimeUtc = utcMidnight;
+  rtcData.version = VERSION;
+
+  saveRTCData();
+
+  // Calculate sleep duration to target time of day
+  time_t sleepSec = targetSec - timeOfDay;
+
+  if (sleepSec < 60) {
+    Serial.print("Next wake time is too soon - skippng sleep\n");
+    nextSleepTime += 3600; // Stay up another hour
+    return;
+  }
+
+  // Wake every hour(ish) or less
+  if (sleepSec > 3600)
+    sleepSec = 3600;
+
+#if SLEEP_TEST_MODE
+  DumpEpochTime("Sleeping at", utcTime, false);
+  DumpEpochTime("localTime", localTime, bst);
+  DumpEpochTime("Wake at", rtcData.nextRunTimeUtc, false);
+#endif
+
+  Serial.printf("sleepSec       : %9lld s\n", sleepSec);
+  Serial.printf("Total uptime   : %9lu ms\n\n", millis());
+  Serial.flush();
+
+  ESP.deepSleep((uint64_t)sleepSec * 1000000ULL, WAKE_RF_DEFAULT);
+}
+
+
+time_t my_timegm(struct tm *tm) {
+  static const uint32_t days_in_month[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+
+  uint32_t year = tm->tm_year + 1900;
+  uint32_t month = tm->tm_mon;
+  if (month > 11) return -1;
+
+  // Days since epoch to start of this year
+  time_t days = (year - 1970) * 365
+                + (year - 1969) / 4  // leap years since 1970
+                - (year - 1901) / 100
+                + (year - 1601) / 400;
+
+  // Add days of months before this one
+  for (uint32_t i = 0; i < month; i++) {
+    days += days_in_month[i];
+    if (i == 1 && ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)))
+      days++;  // leap day in Feb
+  }
+
+  days += tm->tm_mday - 1;
+
+  return days * 86400 + tm->tm_hour * 3600 + tm->tm_min * 60 + tm->tm_sec;
+}
+
+time_t last_sunday_utc(uint32_t year, uint32_t month) {
+  struct tm tm;
+  tm.tm_year = year - 1900;
+  tm.tm_mon = month - 1;
+  tm.tm_mday = 31;  // start at last possible day
+  tm.tm_hour = 1;   // 01:00 UTC
+  time_t t = my_timegm(&tm);
+
+  struct tm *g = gmtime(&t);
+  uint32_t wday = g->tm_wday;          // 0=Sun .. 6=Sat
+  return t - (wday * 24 * 3600);  // back to Sunday
+}
