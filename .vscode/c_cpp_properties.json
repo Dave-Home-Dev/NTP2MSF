@@ -46,7 +46,7 @@
             "includePath": [
                 "/home/david/.arduino15/packages/esp8266/hardware/esp8266/3.1.2/tools/sdk/include",
                 "/home/david/.arduino15/packages/esp8266/hardware/esp8266/3.1.2/tools/sdk/lwip2/include",
-                "/home/david/.cache/arduino/sketches/2FDF017509C4B7E4552B2E3386FE7E0C/core",
+                "/home/david/git/NTP2MSF_V2/build/core",
                 "/home/david/.arduino15/packages/esp8266/hardware/esp8266/3.1.2/cores/esp8266",
                 "/home/david/.arduino15/packages/esp8266/hardware/esp8266/3.1.2/variants/d1_mini",
                 "/home/david/.arduino15/packages/esp8266/hardware/esp8266/3.1.2/libraries/ESP8266WiFi/src",

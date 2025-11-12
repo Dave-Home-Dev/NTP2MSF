@@ -43,19 +43,15 @@ transmitted as 1111100000, while all other seconds are transmitted as
 #include <user_interface.h> // for system_rtc_mem_read/write
 #include "WiFi_Credentials.h"
 
-// LED pins
-#define MSF_PIN D2 // GPIO pin connected to IC101 DATA IN via 1–10kΩ resistor
-#define LED_PIN D4 // GPIO 2
-
 // LED GPIOs
-#define MSF_GPIO 4
-#define LED_GPIO 2
+#define MSF_GPIO 4 // Labelled D2 on NodeMCU
+#define LED_GPIO 2 // Labelled D4 on NodeMCU
 
 // Debugging flags
 #define INVERT_TCO 0
 #define ENABLE_SLEEP_MODE 1
 
-// Define A nd B bit positions
+// Define the positions of the A and B bits in each 1 second frame
 #define A 0
 #define B 1
 
@@ -156,25 +152,8 @@ void IRAM_ATTR onTimerISR()
 
     if (ISR_bit == 0)
     {
-        switch (ISR_subbit)
-        {
-        case 0:
-        case 1:
-        case 2:
-        case 3:
-        case 4:
-            // carrier off 500 ms
-            carrier = LOW;
-            break;
-        case 5:
-        case 6:
-        case 7:
-        case 8:
-        case 9:
-            // carrier on 500 ms
-            carrier = HIGH;
-            break;
-        }
+        // Carrier off for 500 ms, then on for 500 ms
+        carrier = (ISR_subbit < 5) ? LOW : HIGH;
     }
     else
     {
@@ -687,18 +666,27 @@ time_t last_sunday_utc(uint32_t year, uint32_t month)
 //
 void setup()
 {
+    bool ntpSuccess;
 
-    pinMode(MSF_PIN, OUTPUT);
-    digitalWrite(MSF_PIN, LOW);
+    // LED (GPIO2)
+    GPF(LED_GPIO) = GPFFS(GPFFS_GPIO(LED_GPIO));          // Set mode to GPIO
+    GPC(LED_GPIO) = (GPC(LED_GPIO) & (0xF << GPCI));      // SOURCE(GPIO) | DRIVER(NORMAL) | INT_TYPE(UNCHANGED) | WAKEUP_ENABLE(DISABLED)
+    GPES = (1 << LED_GPIO);                               // Enable
+    GPIO_REG_WRITE(GPIO_OUT_W1TS_ADDRESS, 1 << LED_GPIO); // Turn LED off (inverted logic)
 
-    pinMode(LED_PIN, OUTPUT); // Active LOW / current sink
-    ledOn();
+    // MSF (GPIO4)
+    GPF(MSF_GPIO) = GPFFS(GPFFS_GPIO(MSF_GPIO));          // Set mode to GPIO
+    GPC(MSF_GPIO) = (GPC(MSF_GPIO) & (0xF << GPCI));      // SOURCE(GPIO) | DRIVER(NORMAL) | INT_TYPE(UNCHANGED) | WAKEUP_ENABLE(DISABLED)
+    GPES = (1 << MSF_GPIO);                               // Enable
+    GPIO_REG_WRITE(GPIO_OUT_W1TC_ADDRESS, 1 << MSF_GPIO); // Ensure MSF output is low
 
     // Block here forever until WiFi is discovered
     initWiFi();
 
+    // Indicate Wi-Fi connected
     ledOn();
 
+    // Start UDP listener
     udp.begin(LOCALPORT);
 
     // get a random server from the pool
@@ -706,7 +694,8 @@ void setup()
 
     // Order matters! Call GetNtpTime first!
 
-    bool ntpSuccess;
+    // Get the current time from NTP server
+
     do
     {
         // GetNtpTime will attempt to retrieve an NTP packet ten time

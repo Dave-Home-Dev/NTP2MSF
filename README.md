@@ -2,7 +2,11 @@
 A tool to set a radio controlled clock
 
 ## What Problem Does This Solve?
-Many years ago (90's) I bought an alarm clock, a Sony ICF-C50L.  One of the USPs of this was that it is self-setting using the MSF radio signal braodcast by the National Physics Labaratory from a transmitter in Rubgy, UK.
+Many years ago (90's) I bought an alarm clock, a Sony ICF-C50L.  One of the USPs of this was that it is self-setting using the MSF radio signal braodcast by the National Physics Labaratory from a transmitter in Rubgy, UK.  This worked well until the transmitter was relocated to Anthorn in 2007.
+
+The intention of this project is to create a device that replaces the VLF receiver built into the ICF-C50L and replicates the original MSF signal bitstream using NTP as a time reference.  This only needs to run for 15 minuts at 03.00 local time everyday, as the clock itself is designed to start looking for the MSF bitstream at 03.05 localtime, everyday.  This includes the double-whammy of 03.05, localtime, being observed twice at the end of BST in October!
+
+More info: https://en.wikipedia.org/wiki/Time_from_NPL_(MSF)
 
 ## Software and Hardware Used
 	* Arduino IDE v2.3.6
