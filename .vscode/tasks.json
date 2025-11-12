@@ -1,0 +1,42 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Arduino Compile",
+            "type": "shell",
+            "command": "arduino-cli",
+            "args": [
+                "compile",
+                "-v",
+                "-b",
+                "esp8266:esp8266:d1_mini",
+                "NTP2MSF_V2.ino"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": [
+                "$gcc"
+            ]
+        },
+        {
+            "label": "Arduino Upload",
+            "type": "shell",
+            "command": "arduino-cli",
+            "args": [
+                "upload",
+                "-b",
+                "esp8266:esp8266:d1_mini",
+                "-p",
+                "/dev/ttyUSB0",
+                "NTP2MSF_V2.ino"
+            ],
+            "group": "build",
+            "dependsOn": "Arduino Compile",
+            "problemMatcher": [
+                "$gcc"
+            ]
+        }
+    ]
+}

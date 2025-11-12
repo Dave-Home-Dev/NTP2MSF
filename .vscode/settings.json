@@ -1,0 +1,6 @@
+{
+  "arduino.path": "/usr/local/bin/arduino-cli",
+  "arduino.board": "esp8266:esp8266:d1_mini",
+  "arduino.enableUSBDetection": true,
+  "arduino.enableUSBSerialMonitor": true
+}
