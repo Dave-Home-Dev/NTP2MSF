@@ -7,4 +7,5 @@ include/WiFi_Credentials.h
 build/
 compile_commands.json
 *.debug
-
+filter-repo.sh
+replace.txt
