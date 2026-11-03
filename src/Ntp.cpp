@@ -50,7 +50,7 @@ bool exchange(Fix& fix) {
 
             const uint32_t seconds = readBigEndian32(packet + 40);  // transmit timestamp
             const uint32_t fraction = readBigEndian32(packet + 44);
-            if (packet[1] == 0 || seconds < kNtpToUnixSeconds) {
+            if (packet[1] == 0 || seconds == 0) {
                 return false;  // kiss-o'-death or unsynchronised server
             }
 

@@ -17,6 +17,19 @@ constexpr int64_t daysFromCivil(int64_t y, unsigned m, unsigned d) {
     return era * 146097 + static_cast<int64_t>(doe) - 719468;
 }
 
+// Inverse of daysFromCivil(): fills year, month and day for a day count since 1970-01-01.
+void civilFromDays(int64_t z, int& year, int& month, int& day) {
+    z += 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = static_cast<unsigned>(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp = (5 * doy + 2) / 153;
+    day = static_cast<int>(doy - (153 * mp + 2) / 5 + 1);
+    month = static_cast<int>(mp < 10 ? mp + 3 : mp - 9);
+    year = static_cast<int>(yoe + era * 400) + (month <= 2 ? 1 : 0);
+}
+
 // 01:00 UTC on the last Sunday of a 31-day month (March or October).
 time_t lastSundayUtc(int year, unsigned month) {
     const int64_t lastDay = daysFromCivil(year, month, 31);
@@ -26,10 +39,25 @@ time_t lastSundayUtc(int year, unsigned month) {
 
 }  // namespace
 
+Civil civil(time_t utc) {
+    int64_t days = static_cast<int64_t>(utc) / 86400;
+    int64_t secs = static_cast<int64_t>(utc) % 86400;
+    if (secs < 0) {  // floor division for instants before 1970
+        secs += 86400;
+        --days;
+    }
+
+    Civil c;
+    civilFromDays(days, c.year, c.month, c.day);
+    c.weekday = static_cast<int>(((days % 7) + 7 + 4) % 7);  // 1970-01-01 was a Thursday
+    c.hour = static_cast<int>(secs / 3600);
+    c.minute = static_cast<int>(secs % 3600 / 60);
+    c.second = static_cast<int>(secs % 60);
+    return c;
+}
+
 Time fromUtc(time_t utc) {
-    struct tm parts;
-    gmtime_r(&utc, &parts);
-    const int year = parts.tm_year + 1900;
+    const int year = civil(utc).year;
     const time_t start = lastSundayUtc(year, 3);
     const time_t end = lastSundayUtc(year, 10);
 

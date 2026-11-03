@@ -27,16 +27,15 @@ bool MsfFrame::oddParityBit(unsigned first, unsigned last) const {
 
 MsfFrame MsfFrame::encode(time_t announcedUtc) {
     const uk::Time wall = uk::fromUtc(announcedUtc);
-    struct tm t;
-    gmtime_r(&wall.local, &t);
+    const uk::Civil c = uk::civil(wall.local);
 
     MsfFrame f;
-    f.putBcd(17, 8, t.tm_year % 100);  // year
-    f.putBcd(25, 5, t.tm_mon + 1);     // month
-    f.putBcd(30, 6, t.tm_mday);        // day of month
-    f.putBcd(36, 3, t.tm_wday);        // day of week, 0 = Sunday
-    f.putBcd(39, 6, t.tm_hour);        // hour
-    f.putBcd(45, 7, t.tm_min);         // minute
+    f.putBcd(17, 8, c.year % 100);  // year
+    f.putBcd(25, 5, c.month);     // month
+    f.putBcd(30, 6, c.day);        // day of month
+    f.putBcd(36, 3, c.weekday);        // day of week, 0 = Sunday
+    f.putBcd(39, 6, c.hour);        // hour
+    f.putBcd(45, 7, c.minute);         // minute
 
     // Seconds 52..59 carry 01111110 on the A bits as a fixed marker.
     for (unsigned s = 53; s <= 58; ++s) {

@@ -17,6 +17,7 @@
 #include "RtcState.h"
 #include "Transmitter.h"
 #include "UkTime.h"
+#include "Align.h"
 
 namespace {
 
@@ -32,8 +33,11 @@ time_t g_runUntil = 0;  // keep transmitting until g_minute reaches this
     }
 }
 
-time_t capNap(time_t seconds) {
-    return seconds > static_cast<time_t>(cfg::kMaxNapSeconds) ? static_cast<time_t>(cfg::kMaxNapSeconds) : seconds;
+// Nap a little less than needed; the next wake re-syncs and sleeps the remainder.
+time_t napLength(time_t remaining) {
+    const time_t cap = static_cast<time_t>(cfg::kMaxNapSeconds);
+    time_t nap = remaining > 600 ? remaining - remaining / 20 : remaining;  // 5% margin
+    return nap > cap ? cap : nap;
 }
 
 // Woken early by the hourly nap timer? Go straight back to sleep until it is time.
@@ -44,27 +48,22 @@ void napIfNotDue(time_t now) {
     }
     const int64_t remaining = static_cast<int64_t>(wake) - static_cast<int64_t>(now);
     if (remaining > cfg::kMinNapSeconds && remaining <= cfg::kMaxWakeAheadSeconds) {
-        deepSleepFor(capNap(static_cast<time_t>(remaining)));
+        deepSleepFor(napLength(static_cast<time_t>(remaining)));
     }
 }
 
 // Breathe the LED until timer1 must start, then start it so that its first tick lands
 // exactly on a minute boundary. Sets g_minute and g_runUntil.
 void alignAndStart(const ntp::Fix& fix) {
-    const time_t minuteZero = fix.utc - fix.utc % 60;
-    const uint32_t sinceMs = static_cast<uint32_t>(fix.utc % 60) * 1000u + fix.ms + (millis() - fix.rxMillis);
+    const uint32_t now = millis();
+    const Alignment a = alignToMinute(fix.utc, fix.ms, now - fix.rxMillis,
+                                      cfg::kSubbitMs, kMinLeadMs);
 
-    // Time until the next boundary, less one sub-bit because that is how long the first tick takes.
-    int32_t wait = 60000 - static_cast<int32_t>(sinceMs % 60000) - static_cast<int32_t>(cfg::kSubbitMs);
-    g_minute = minuteZero + 60 * static_cast<time_t>(sinceMs / 60000 + 1);
-    if (wait < kMinLeadMs) {
-        wait += 60000;  // too close to make it: aim for the following minute
-        g_minute += 60;
-    }
+    g_minute = a.firstMinute;
     g_runUntil = g_minute + static_cast<time_t>(cfg::kRunSeconds);
 
-    const uint32_t startAt = millis() + static_cast<uint32_t>(wait);
-    led::pulse(static_cast<uint32_t>(wait) - 10, cfg::kWaitPulseStepMs, false);
+    const uint32_t startAt = now + static_cast<uint32_t>(a.waitMs);
+    led::pulse(static_cast<uint32_t>(a.waitMs) - 10, cfg::kWaitPulseStepMs, false);
     while (static_cast<int32_t>(startAt - millis()) > 0) {
         // spin for the last few milliseconds
     }
@@ -83,7 +82,7 @@ void sleepIfRunFinished() {
         return;
     }
     rtc::saveWakeTime(wake);
-    deepSleepFor(capNap(until));
+    deepSleepFor(napLength(until));
 }
 
 }  // namespace
